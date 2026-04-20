@@ -8,6 +8,8 @@ import unicodedata
 import json
 import os
 import requests
+import numpy as np
+from fastembed import TextEmbedding
 from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
@@ -22,6 +24,14 @@ MODEL = "gemma4:31b-cloud"
 OLLAMA_HOST = "https://ollama.com"
 LLM_CHAR_BUDGET = 420
 REQUEST_TIMEOUT_SECONDS = 8
+
+try:
+    EMBEDDER = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+    MOVIE_EMBEDDINGS = np.load(Path(__file__).parent / "movie_embeddings.npy")
+except Exception as e:
+    print("Warning: Fastembed or vectors missing. Deploy to Leapcell with the .npy file!", e)
+    EMBEDDER = None
+    MOVIE_EMBEDDINGS = None
 
 STOPWORDS = {
     "a", "about", "after", "all", "an", "and", "any", "are", "as", "at", "be",
@@ -78,6 +88,7 @@ class Movie:
     tmdb_id: int
     title: str
     year: int | None
+    runtime_min: int | None
     genres: tuple[str, ...]
     overview: str
     tagline: str
@@ -168,6 +179,7 @@ def load_movies() -> tuple[Movie, ...]:
             "tmdb_id": tmdb_id,
             "title": title,
             "year": _safe_int(row[index["year"]]),
+            "runtime_min": _safe_int(row[index["runtime_min"]]),
             "genres": split_csvish(row[index["genres"]]),
             "overview": str(row[index["overview"]] or "").strip(),
             "tagline": str(row[index["tagline"]] or "").strip(),
@@ -214,6 +226,7 @@ def load_movies() -> tuple[Movie, ...]:
                 tmdb_id=int(raw_movie["tmdb_id"]),
                 title=str(raw_movie["title"]),
                 year=raw_movie["year"],
+                runtime_min=raw_movie["runtime_min"],
                 genres=tuple(raw_movie["genres"]),
                 overview=str(raw_movie["overview"]),
                 tagline=str(raw_movie["tagline"]),
@@ -398,141 +411,13 @@ def build_history_profile(history: list[str], history_ids: list[int]) -> dict[st
     return profile
 
 
-def build_query_weights(
-    preferences: str, history: list[str], history_ids: list[int]
-) -> tuple[Counter[str], dict[str, object], dict[str, Counter[str]]]:
-    signals = extract_preferences(preferences)
-    history_profile = build_history_profile(history, history_ids)
-    query_weights: Counter[str] = Counter(signals["token_weights"])
+def build_query_weights(preferences: str, history: list[str], history_ids: list[int]) -> tuple[dict, dict, dict]:
+    # Deprecated in RAG architecture.
+    pass
 
-    if "agent_intent" in signals:
-        vibe_keywords = signals["agent_intent"].get("vibe_keywords", [])
-        for vibe in vibe_keywords:
-            for token in tokenize(vibe):
-                query_weights[token] += 3.0
-
-    history_strength = 1.0 if len(query_weights) < 4 and not signals["preferred_genres"] else 0.35
-
-    for genre, count in history_profile["genres"].most_common(4):
-        for token in tokenize(genre):
-            query_weights[token] += history_strength * min(count, 2)
-
-    for token, count in history_profile["keywords"].most_common(10):
-        query_weights[token] += 0.35 * min(count, 3)
-
-    for token, count in history_profile["cast"].most_common(6):
-        query_weights[token] += 0.25 * min(count, 2)
-
-    for token, count in history_profile["director"].most_common(3):
-        query_weights[token] += 0.6 * min(count, 2)
-
-    return query_weights, signals, history_profile
-
-
-def score_movie(
-    movie: Movie,
-    query_weights: Counter[str],
-    signals: dict[str, object],
-    history_profile: dict[str, Counter[str]],
-    watched_ids: set[int],
-) -> float:
-    if movie.tmdb_id in watched_ids:
-        return float("-inf")
-
-    idf = token_idf()
-    score = 0.0
-
-    for token, weight in query_weights.items():
-        if token in movie.token_set:
-            score += weight * idf.get(token, 1.0)
-
-    movie_genres = {normalize_text(genre) for genre in movie.genres}
-
-    for genre in signals["preferred_genres"]:
-        if genre in movie_genres:
-            score += 8.0
-        else:
-            score -= 6.0
-
-    for genre in signals["avoided_genres"]:
-        if genre in movie_genres:
-            score -= 10.0
-
-    matched_preferred = sum(1 for genre in signals["preferred_genres"] if genre in movie_genres)
-    preferred_count = len(signals["preferred_genres"])
-    if preferred_count >= 2 and matched_preferred == preferred_count:
-        score += 6.0
-    elif preferred_count >= 2 and matched_preferred == 0:
-        score -= 6.0
-
-    for token in signals["excluded_tokens"]:
-        if token in movie.token_set or token in movie.searchable_blob:
-            score -= 5.0
-
-    shared_history_genres = sum(history_profile["genres"].get(genre, 0) for genre in movie_genres)
-    score += min(shared_history_genres, 4) * 0.9
-
-    keyword_overlap = sum(history_profile["keywords"].get(token, 0) for token in movie.token_set)
-    score += min(keyword_overlap, 10) * 0.18
-
-    if movie.director:
-        director_overlap = sum(history_profile["director"].get(token, 0) for token in tokenize(movie.director))
-        score += director_overlap * 0.8
-
-    cast_overlap = sum(history_profile["cast"].get(token, 0) for token in tokenize(" ".join(movie.cast[:3])))
-    score += min(cast_overlap, 3) * 0.5
-
-    agent_intent = signals.get("agent_intent", {})
-    if agent_intent:
-        must_have = {normalize_text(g) for g in agent_intent.get("must_have_genres", [])}
-        must_have.update(signals["preferred_genres"])
-        
-        must_not_have = {normalize_text(g) for g in agent_intent.get("must_not_have_genres", [])}
-        must_not_have.update(signals["avoided_genres"])
-        
-        for g in must_have:
-            if g and g not in movie_genres:
-                score -= 30.0
-        for g in must_not_have:
-            if g and g in movie_genres:
-                score -= 30.0
-
-        target_era = agent_intent.get("target_era", "any")
-        if target_era != "any" and movie.year:
-            if target_era == "classic" and movie.year < 1990: score += 6.0
-            elif target_era == "90s" and 1990 <= movie.year <= 1999: score += 6.0
-            elif target_era == "2000s" and 2000 <= movie.year <= 2014: score += 6.0
-            elif target_era == "recent" and movie.year >= 2015: score += 6.0
-            else: score -= 3.0
-
-        discovery_mode = agent_intent.get("discovery_mode", "neutral")
-        if discovery_mode == "hidden_gem":
-            score += (movie.vote_average - 7.0) * 4.0
-            score -= min(movie.popularity / 50.0, 8.0) 
-            score += movie.quality_score * 0.5 
-        elif discovery_mode == "blockbuster":
-            score += math.log1p(movie.popularity) * 2.0
-            score += movie.quality_score * 3.0
-        else:
-            score += movie.quality_score * 3.0
-    else:
-        score += movie.quality_score * 3.0
-
-    if movie.vote_average < 6.0:
-        score -= 6.0
-    elif movie.vote_average < 6.5:
-        score -= 2.5
-
-    if movie.vote_average >= 7.5:
-        score += 1.5
-
-    if movie.vote_count >= 5000:
-        score += 1.2
-
-    if movie.us_rating == "R" and "family" in signals["normalized"]:
-        score -= 8.0
-
-    return score
+def score_movie():
+    # Deprecated in RAG architecture.
+    pass
 
 
 def explain_match(
@@ -675,7 +560,7 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
 
     candidates_text = ""
     for i, m in enumerate(movies):
-        candidates_text += f"[{i+1}] {m.title} ({m.year or 'Unknown'}) | tmdb_id: {m.tmdb_id}\nGenres: {', '.join(m.genres)}\nOverview: {m.overview}\n\n"
+        candidates_text += f"[{i+1}] {m.title} ({m.year or 'Unknown'}) | Runtime: {m.runtime_min or 'Unknown'} min | tmdb_id: {m.tmdb_id}\nGenres: {', '.join(m.genres)}\nOverview: {m.overview}\n\n"
 
     prompt = (
         "You are an expert, persuasive movie recommendation agent.\n"
@@ -685,7 +570,7 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
         f"{candidates_text}"
         "Task:\n"
         "1. Act as a judge. Compare these candidates against the user's specific preferences and pick the single best fit.\n"
-        f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points).\n"
+        f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points). IMPORTANT: Cleverly incorporate the movie's runtime and genres into your pitch gracefully (e.g., 'In this intense 120-minute sci-fi thriller...').\n"
         "3. Output ONLY a valid JSON object matching this exact shape:\n"
         '{"thought_process": "<explain why this movie perfectly matches in 15 words>", "tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
     )
@@ -736,18 +621,77 @@ def validate_output(candidate: dict[str, object], watched_ids: set[int]) -> dict
     if not description:
         raise ValueError("description cannot be empty")
 
-    return {"tmdb_id": movie_id, "description": enforce_description_limit(description)}
+    movie = movie_lookup()[movie_id]
+
+    return {
+        "tmdb_id": movie_id,
+        "movie_info": {
+            "title": movie.title,
+            "year": movie.year,
+            "runtime_min": movie.runtime_min,
+            "director": movie.director,
+            "genres": list(movie.genres),
+            "vote_average": movie.vote_average
+        },
+        "description": enforce_description_limit(description)
+    }
 
 
 def choose_top_movies(
     preferences: str, history: list[str], history_ids: list[int], top_k: int = 5
 ) -> tuple[list[Movie], dict[str, object], dict[str, Counter[str]], set[int]]:
     watched_ids = watched_movie_ids(history, history_ids)
-    query_weights, signals, history_profile = build_query_weights(preferences, history, history_ids)
+    signals = extract_preferences(preferences)
+    history_profile = build_history_profile(history, history_ids)
+
+    all_movies = list(load_movies())
+
+    if EMBEDDER is not None and MOVIE_EMBEDDINGS is not None:
+        prompt_vec = list(EMBEDDER.embed([preferences]))[0]
+        similarities = np.dot(MOVIE_EMBEDDINGS, prompt_vec)
+    else:
+        similarities = np.zeros(len(all_movies))
 
     scored = []
-    for movie in load_movies():
-        score = score_movie(movie, query_weights, signals, history_profile, watched_ids)
+    agent_intent = signals.get("agent_intent", {})
+    must_have = {normalize_text(g) for g in agent_intent.get("must_have_genres", [])} | signals.get("preferred_genres", set())
+    must_not_have = {normalize_text(g) for g in agent_intent.get("must_not_have_genres", [])} | signals.get("avoided_genres", set())
+        
+    for i, movie in enumerate(all_movies):
+        if movie.tmdb_id in watched_ids:
+            continue
+        
+        score = float(similarities[i]) * 15.0
+
+        movie_genres = {normalize_text(genre) for genre in movie.genres}
+        
+        for g in must_have:
+            if g and g not in movie_genres:
+                score -= 30.0
+        for g in must_not_have:
+            if g and g in movie_genres:
+                score -= 30.0
+
+        target_era = agent_intent.get("target_era", "any")
+        if target_era != "any" and movie.year:
+            if target_era == "classic" and movie.year < 1990: score += 5.0
+            elif target_era == "90s" and 1990 <= movie.year <= 1999: score += 5.0
+            elif target_era == "2000s" and 2000 <= movie.year <= 2014: score += 5.0
+            elif target_era == "recent" and movie.year >= 2015: score += 5.0
+            else: score -= 3.0
+
+        discovery_mode = agent_intent.get("discovery_mode", "neutral")
+        if discovery_mode == "hidden_gem":
+            score += (movie.vote_average - 7.0) * 3.0
+            score -= min(movie.popularity / 50.0, 5.0) 
+        elif discovery_mode == "blockbuster":
+            score += math.log1p(movie.popularity) * 2.0
+
+        score += movie.quality_score * 1.5
+
+        if movie.us_rating == "R" and "family" in signals["normalized"]:
+            score -= 15.0
+        
         if math.isfinite(score):
             scored.append((score, movie))
 
@@ -756,7 +700,7 @@ def choose_top_movies(
 
     if not top_movies:
         fallback = max(
-            (movie for movie in load_movies() if movie.tmdb_id not in watched_ids),
+            (movie for movie in all_movies if movie.tmdb_id not in watched_ids),
             key=lambda item: item.quality_score,
         )
         top_movies = [fallback]
