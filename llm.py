@@ -687,7 +687,7 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
         "1. Act as a judge. Compare these candidates against the user's specific preferences and pick the single best fit.\n"
         f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points).\n"
         "3. Output ONLY a valid JSON object matching this exact shape:\n"
-        '{"tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
+        '{"thought_process": "<explain why this movie perfectly matches in 15 words>", "tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
     )
 
     try:
