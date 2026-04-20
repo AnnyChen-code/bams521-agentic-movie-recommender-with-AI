@@ -5,6 +5,9 @@ import math
 import re
 import time
 import unicodedata
+import json
+import os
+import requests
 from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
@@ -15,6 +18,10 @@ from openpyxl import load_workbook
 
 DATA_PATH = Path(__file__).with_name("tmdb_top1000_movies.xlsx")
 DESCRIPTION_LIMIT = 500
+MODEL = "gemma4:31b-cloud"
+OLLAMA_HOST = "https://ollama.com"
+LLM_CHAR_BUDGET = 420
+REQUEST_TIMEOUT_SECONDS = 8
 
 STOPWORDS = {
     "a", "about", "after", "all", "an", "and", "any", "are", "as", "at", "be",
@@ -465,7 +472,7 @@ def enforce_description_limit(text: str) -> str:
     return truncated[: DESCRIPTION_LIMIT - 1].rstrip() + "..."
 
 
-def generate_description(movie: Movie, preferences: str, history: list[str], reasons: list[str], start_time: float) -> str:
+def deterministic_description(movie: Movie, preferences: str, history: list[str], reasons: list[str], start_time: float) -> str:
     movie_genres = {normalize_text(g) for g in movie.genres}
     pref_text = normalize_text(preferences)
     keyword_text = " ".join(movie.keywords).lower()
@@ -556,6 +563,67 @@ def generate_description(movie: Movie, preferences: str, history: list[str], rea
     return enforce_description_limit(description)
 
 
+def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: list[str], signals: dict[str, object], history_profile: dict[str, Counter[str]], start_time: float) -> dict:
+    fallback_movie = movies[0]
+    fallback_reasons = explain_match(fallback_movie, preferences, signals, history_profile)
+    fallback_desc = deterministic_description(fallback_movie, preferences, history, fallback_reasons, start_time)
+    fallback_candidate = {"tmdb_id": fallback_movie.tmdb_id, "description": fallback_desc}
+
+    api_key = os.getenv("OLLAMA_API_KEY")
+    remaining_budget = REQUEST_TIMEOUT_SECONDS - (time.monotonic() - start_time)
+    if not api_key or remaining_budget < 2.0:
+        return fallback_candidate
+
+    candidates_text = ""
+    for i, m in enumerate(movies):
+        candidates_text += f"[{i+1}] {m.title} ({m.year or 'Unknown'}) | tmdb_id: {m.tmdb_id}\nGenres: {', '.join(m.genres)}\nOverview: {m.overview}\n\n"
+
+    prompt = (
+        "You are an expert, persuasive movie recommendation agent.\n"
+        f"User preferences: {preferences}\n"
+        f"Watch history: {', '.join(history[:8]) if history else 'None provided'}\n\n"
+        "Here are the top candidates that match their taste profile:\n"
+        f"{candidates_text}"
+        "Task:\n"
+        "1. Act as a judge. Compare these candidates against the user's specific preferences and pick the single best fit.\n"
+        f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points).\n"
+        "3. Output ONLY a valid JSON object matching this exact shape:\n"
+        '{"tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
+    )
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a movie recommendation AI. You MUST output ONLY valid JSON without markdown wrapping."
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "stream": False,
+            },
+            timeout=(2, max(2.0, min(remaining_budget, REQUEST_TIMEOUT_SECONDS))),
+        )
+        response.raise_for_status()
+        content = response.json().get("message", {}).get("content", "").strip()
+
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            parsed = json.loads(match.group(0))
+            if "tmdb_id" in parsed and "description" in parsed:
+                return {
+                    "tmdb_id": int(parsed["tmdb_id"]),
+                    "description": enforce_description_limit(str(parsed["description"]))
+                }
+        raise ValueError("Invalid JSON schema returned by LLM.")
+    except Exception:
+        return fallback_candidate
+
+
 def validate_output(candidate: dict[str, object], watched_ids: set[int]) -> dict[str, object]:
     movie_id = candidate.get("tmdb_id")
     description = str(candidate.get("description", "")).strip()
@@ -572,35 +640,35 @@ def validate_output(candidate: dict[str, object], watched_ids: set[int]) -> dict
     return {"tmdb_id": movie_id, "description": enforce_description_limit(description)}
 
 
-def choose_movie(
-    preferences: str, history: list[str], history_ids: list[int]
-) -> tuple[Movie, dict[str, object], dict[str, Counter[str]], set[int]]:
+def choose_top_movies(
+    preferences: str, history: list[str], history_ids: list[int], top_k: int = 5
+) -> tuple[list[Movie], dict[str, object], dict[str, Counter[str]], set[int]]:
     watched_ids = watched_movie_ids(history, history_ids)
     query_weights, signals, history_profile = build_query_weights(preferences, history, history_ids)
 
     scored = []
     for movie in load_movies():
         score = score_movie(movie, query_weights, signals, history_profile, watched_ids)
-        scored.append((score, movie))
+        if math.isfinite(score):
+            scored.append((score, movie))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    for score, movie in scored:
-        if math.isfinite(score):
-            return movie, signals, history_profile, watched_ids
+    top_movies = [movie for score, movie in scored[:top_k]]
 
-    fallback = max(
-        (movie for movie in load_movies() if movie.tmdb_id not in watched_ids),
-        key=lambda item: item.quality_score,
-    )
-    return fallback, signals, history_profile, watched_ids
+    if not top_movies:
+        fallback = max(
+            (movie for movie in load_movies() if movie.tmdb_id not in watched_ids),
+            key=lambda item: item.quality_score,
+        )
+        top_movies = [fallback]
+
+    return top_movies, signals, history_profile, watched_ids
 
 
 def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
     start_time = time.monotonic()
-    movie, signals, history_profile, watched_ids = choose_movie(preferences, history, history_ids)
-    reasons = explain_match(movie, preferences, signals, history_profile)
-    description = generate_description(movie, preferences, history, reasons, start_time)
-    candidate = {"tmdb_id": movie.tmdb_id, "description": description}
+    movies, signals, history_profile, watched_ids = choose_top_movies(preferences, history, history_ids, top_k=5)
+    candidate = agentic_judge_and_describe(movies, preferences, history, signals, history_profile, start_time)
     return validate_output(candidate, watched_ids)
 
 
