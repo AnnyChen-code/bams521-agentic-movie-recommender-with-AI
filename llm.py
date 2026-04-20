@@ -258,7 +258,7 @@ def token_idf() -> dict[str, float]:
     return {token: math.log((doc_count + 1) / (count + 1)) + 1.0 for token, count in counts.items()}
 
 
-def extract_preferences(preferences: str) -> dict[str, object]:
+def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
     normalized = normalize_text(preferences)
     tokens = tokenize(preferences)
     token_weights: Counter[str] = Counter()
@@ -307,6 +307,65 @@ def extract_preferences(preferences: str) -> dict[str, object]:
     }
 
 
+def agentic_extract_intent(preferences: str) -> dict | None:
+    api_key = os.getenv("OLLAMA_API_KEY")
+    if not api_key:
+        return None
+
+    prompt = f"""
+Analyze this movie request: "{preferences}"
+
+Extract the user's intent into exactly this JSON format. No markdown or text.
+{{
+  "must_have_genres": [],
+  "must_not_have_genres": [],
+  "target_era": "any", 
+  "discovery_mode": "neutral", 
+  "vibe_keywords": []
+}}
+
+Rules for values:
+target_era choices: "classic" (pre-1990), "90s" (1990-1999), "2000s", "recent" (2015+), "any"
+discovery_mode choices: "hidden_gem" (unknown/underrated), "blockbuster" (popular/famous), "neutral"
+vibe_keywords: max 5 english words describing pacing or vibe (e.g. short, fast, creepy)
+"""
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are an intent extractor. Return ONLY valid JSON."
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "stream": False,
+            },
+            timeout=3,
+        )
+        response.raise_for_status()
+        content = response.json().get("message", {}).get("content", "").strip()
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            parsed = json.loads(match.group(0))
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def extract_preferences(preferences: str) -> dict[str, object]:
+    signals = heuristic_extract_preferences(preferences)
+    agent_signals = agentic_extract_intent(preferences)
+    if agent_signals:
+        signals["agent_intent"] = agent_signals
+    return signals
+
+
 def watched_movie_ids(history: list[str], history_ids: list[int]) -> set[int]:
     watched_ids = {int(movie_id) for movie_id in history_ids if isinstance(movie_id, int) or str(movie_id).isdigit()}
     for title in history:
@@ -345,6 +404,12 @@ def build_query_weights(
     signals = extract_preferences(preferences)
     history_profile = build_history_profile(history, history_ids)
     query_weights: Counter[str] = Counter(signals["token_weights"])
+
+    if "agent_intent" in signals:
+        vibe_keywords = signals["agent_intent"].get("vibe_keywords", [])
+        for vibe in vibe_keywords:
+            for token in tokenize(vibe):
+                query_weights[token] += 3.0
 
     history_strength = 1.0 if len(query_weights) < 4 and not signals["preferred_genres"] else 0.35
 
@@ -417,7 +482,38 @@ def score_movie(
     cast_overlap = sum(history_profile["cast"].get(token, 0) for token in tokenize(" ".join(movie.cast[:3])))
     score += min(cast_overlap, 3) * 0.5
 
-    score += movie.quality_score * 3.0
+    agent_intent = signals.get("agent_intent", {})
+    if agent_intent:
+        must_have = {normalize_text(g) for g in agent_intent.get("must_have_genres", [])}
+        must_not_have = {normalize_text(g) for g in agent_intent.get("must_not_have_genres", [])}
+        
+        for g in must_have:
+            if g and g not in movie_genres:
+                score -= 30.0
+        for g in must_not_have:
+            if g and g in movie_genres:
+                score -= 30.0
+
+        target_era = agent_intent.get("target_era", "any")
+        if target_era != "any" and movie.year:
+            if target_era == "classic" and movie.year < 1990: score += 6.0
+            elif target_era == "90s" and 1990 <= movie.year <= 1999: score += 6.0
+            elif target_era == "2000s" and 2000 <= movie.year <= 2014: score += 6.0
+            elif target_era == "recent" and movie.year >= 2015: score += 6.0
+            else: score -= 3.0
+
+        discovery_mode = agent_intent.get("discovery_mode", "neutral")
+        if discovery_mode == "hidden_gem":
+            score += (movie.vote_average - 7.0) * 4.0
+            score -= min(movie.popularity / 50.0, 8.0) 
+            score += movie.quality_score * 0.5 
+        elif discovery_mode == "blockbuster":
+            score += math.log1p(movie.popularity) * 2.0
+            score += movie.quality_score * 3.0
+        else:
+            score += movie.quality_score * 3.0
+    else:
+        score += movie.quality_score * 3.0
 
     if movie.vote_average < 6.0:
         score -= 6.0
