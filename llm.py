@@ -485,7 +485,10 @@ def score_movie(
     agent_intent = signals.get("agent_intent", {})
     if agent_intent:
         must_have = {normalize_text(g) for g in agent_intent.get("must_have_genres", [])}
+        must_have.update(signals["preferred_genres"])
+        
         must_not_have = {normalize_text(g) for g in agent_intent.get("must_not_have_genres", [])}
+        must_not_have.update(signals["avoided_genres"])
         
         for g in must_have:
             if g and g not in movie_genres:
