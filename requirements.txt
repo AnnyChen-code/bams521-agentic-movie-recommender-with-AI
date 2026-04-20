@@ -1,4 +1,3 @@
 flask
-gunicorn
 openpyxl
 requests
