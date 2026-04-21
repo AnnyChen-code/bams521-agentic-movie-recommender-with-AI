@@ -316,13 +316,29 @@ def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
                     explicit_exclusions.add(token)
             start = idx + len(negation)
 
-    return {
+    signals = {
         "normalized": normalized,
         "token_weights": token_weights,
         "preferred_genres": preferred_genres,
         "avoided_genres": avoided_genres,
         "excluded_tokens": explicit_exclusions,
+        "heuristic_eras": set()
     }
+
+    # Heuristic Era Detection (multi-era support)
+    if any(word in normalized for word in ["90s", "1990s", "nineties"]):
+        signals["heuristic_eras"].add("90s")
+    if any(word in normalized for word in ["2000s", "2000", "naughties"]):
+        signals["heuristic_eras"].add("2000s")
+    if any(word in normalized for word in ["classic", "old school", "golden age"]):
+        signals["heuristic_eras"].add("classic")
+    if any(word in normalized for word in ["recent", "newest", "last few years", "latest"]):
+        signals["heuristic_eras"].add("recent")
+
+    if not signals["heuristic_eras"]:
+        signals["heuristic_eras"].add("any")
+
+    return signals
 
 
 def agentic_extract_intent(preferences: str) -> dict | None:
@@ -337,13 +353,13 @@ Extract the user's intent into exactly this JSON format. No markdown or text.
 {{
   "must_have_genres": [],
   "must_not_have_genres": [],
-  "target_era": "any", 
+  "target_eras": ["any"], 
   "discovery_mode": "neutral", 
   "vibe_keywords": []
 }}
 
 Rules for values:
-target_era choices: "classic" (pre-1990), "90s" (1990-1999), "2000s", "recent" (2015+), "any"
+target_eras choices: list containing any of ["classic", "90s", "2000s", "recent", "any"]
 discovery_mode choices: "hidden_gem" (unknown/underrated), "blockbuster" (popular/famous), "neutral"
 vibe_keywords: max 5 english words describing pacing or vibe (e.g. short, fast, creepy)
 """
@@ -510,18 +526,28 @@ def score_movie(
         
         for g in must_have:
             if g and g not in movie_genres:
-                score -= 30.0
+                score -= 100.0
         for g in must_not_have:
             if g and g in movie_genres:
-                score -= 30.0
+                score -= 100.0
 
-        target_era = agent_intent.get("target_era", "any")
-        if target_era != "any" and movie.year:
-            if target_era == "classic" and movie.year < 1990: score += 6.0
-            elif target_era == "90s" and 1990 <= movie.year <= 1999: score += 6.0
-            elif target_era == "2000s" and 2000 <= movie.year <= 2014: score += 6.0
-            elif target_era == "recent" and movie.year >= 2015: score += 6.0
-            else: score -= 3.0
+        target_eras = set(agent_intent.get("target_eras", []))
+        if not target_eras or "any" in target_eras:
+             # Fallback to heuristic era if agent failed
+             h_eras = signals.get("heuristic_eras", {"any"})
+             target_eras = h_eras
+             
+        if "any" not in target_eras and movie.year:
+            match_any_era = False
+            if "classic" in target_eras and movie.year < 1990: match_any_era = True
+            if "90s" in target_eras and 1990 <= movie.year <= 1999: match_any_era = True
+            if "2000s" in target_eras and 2000 <= movie.year <= 2014: match_any_era = True
+            if "recent" in target_eras and movie.year >= 2015: match_any_era = True
+            
+            if match_any_era:
+                score += 15.0
+            else:
+                score -= 100.0  # CRUSHING PENALTY
 
         discovery_mode = agent_intent.get("discovery_mode", "neutral")
         if discovery_mode == "hidden_gem":
@@ -711,6 +737,7 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
         "   RULE 4 - VIVID DESCRIPTION: Use vivid, specific, emotionally charged language about the movie's vibe. Avoid generic words like 'great' or 'amazing'.\n"
         "   RULE 5 - DEFEND NEGATIVES: If the user expressed hates or avoidances, actively rebut them (e.g. 'This isn't a loud action flick, but a...'). This builds trust.\n"
         "   RULE 6 - COMPELLING CLOSE: End with one punchy sentence that makes them want to watch it right now.\n"
+        "   RULE 7 - STRICT CONSTRAINTS: You MUST respect the Era (Year) and Avoided Genres. If the candidates list above has a movie that violates these, IGNORE IT. Do not recommend a 2017 movie if user asked for 90s/2000s.\n"
         "3. Output ONLY a valid JSON object matching this exact shape:\n"
         '{"thought_process": "<why this movie perfectly matches in 15 words>", "tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
     )
