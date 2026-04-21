@@ -595,17 +595,17 @@ def deterministic_description(movie: Movie, preferences: str, history: list[str]
     keyword_text = " ".join(movie.keywords).lower()
 
     if "animation" in movie_genres and any(word in pref_text for word in ["emotional", "heart", "animated", "warm"]):
-        hook = f"If you want something animated that feels heartfelt without being overly sweet, {movie.title} is a great call."
+        hook = f"If you want something animated that feels heartfelt, {movie.title} is a great {movie.runtime_min}-minute pick."
     elif "romance" in movie_genres and "comedy" in movie_genres:
-        hook = f"If you want something charming, funny, and easy to fall into, {movie.title} is a great call."
+        hook = f"If you're looking for a charming {movie.runtime_min}-minute escape, {movie.title} is a great call."
     elif "horror" in movie_genres:
-        hook = f"If you want something genuinely creepy that still feels like a smart pick, {movie.title} looks especially well chosen."
+        hook = f"If you want a smart and creepy {movie.runtime_min}-minute experience, {movie.title} looks well chosen."
     elif "thriller" in movie_genres or "mystery" in movie_genres:
-        hook = f"If you're in the mood for something tense, sharp, and satisfying, {movie.title} is an easy one to get excited about."
+        hook = f"If you're in the mood for a sharp {movie.runtime_min}-minute thrill, {movie.title} is a satisfying choice."
     elif "science fiction" in movie_genres:
-        hook = f"If you want something imaginative with real momentum, {movie.title} feels like a very fun choice."
+        hook = f"If you want an imaginative {movie.runtime_min}-minute journey, {movie.title} feels like a fun choice."
     else:
-        hook = f"If you want something that really fits this mood, {movie.title} is a strong choice."
+        hook = f"If you want something that really fits this mood, {movie.title} is a strong {movie.runtime_min}-minute choice."
 
     fit_reasons = []
 
@@ -702,14 +702,15 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
         "Here are the top candidates that match their taste profile:\n"
         f"{candidates_text}"
         "Task:\n"
-        "1. Act as a judge. Pick the single best candidate that fits the user's preferences.\n"
+        "1. Act as a judge. Pick the single best candidate. Note: The list below is ALREADY RANKED by our mathematical engine. Respect the rank unless you find a reason it fails the user's specific tone/vibe.\n"
         f"2. Write a persuasive, emotionally resonant recommendation blurb (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points). "
-        "Follow these 5 rules for the blurb:\n"
+        "Follow these 6 rules for the blurb:\n"
         "   RULE 1 - OPEN WITH HISTORY: Start by referencing a specific movie from their Watch history that shares DNA with your pick (e.g. 'Since you loved [watched movie]...'). Skip if no history.\n"
-        "   RULE 2 - WEAVE IN RUNTIME: In the first two sentences, naturally embed the runtime (e.g. 'In this gripping [X]-minute thriller...'). Do NOT skip this if runtime is available.\n"
-        "   RULE 3 - VIVID DESCRIPTION: Use 1-2 sentences of vivid, specific, emotionally charged language about the experience. Avoid generic words like 'great' or 'amazing'.\n"
-        "   RULE 4 - DEFEND NEGATIVES: If the user expressed hates or avoidances, actively rebut them in your blurb (e.g. 'This isn't a loud action flick, but a...'). This builds trust.\n"
-        "   RULE 5 - COMPELLING CLOSE: End with one sentence that makes them want to press play right now.\n"
+        "   RULE 2 - WEAVE IN RUNTIME: In the first or second sentence, naturally embed the runtime (e.g. 'In this gripping [X]-minute thriller...'). Do NOT skip this.\n"
+        "   RULE 3 - NAME THE MOVIE: You MUST explicitly use the title of the recommended movie in the first two sentences so the user knows exactly what you picked.\n"
+        "   RULE 4 - VIVID DESCRIPTION: Use vivid, specific, emotionally charged language about the movie's vibe. Avoid generic words like 'great' or 'amazing'.\n"
+        "   RULE 5 - DEFEND NEGATIVES: If the user expressed hates or avoidances, actively rebut them (e.g. 'This isn't a loud action flick, but a...'). This builds trust.\n"
+        "   RULE 6 - COMPELLING CLOSE: End with one punchy sentence that makes them want to watch it right now.\n"
         "3. Output ONLY a valid JSON object matching this exact shape:\n"
         '{"thought_process": "<why this movie perfectly matches in 15 words>", "tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
     )
