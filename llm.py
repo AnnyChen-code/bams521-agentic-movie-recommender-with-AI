@@ -692,7 +692,7 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
         f"{candidates_text}"
         "Task:\n"
         "1. Act as a judge. Compare these candidates against the user's specific preferences and pick the single best fit.\n"
-        f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points). IMPORTANT: Cleverly incorporate the movie's runtime and genres into your pitch gracefully (e.g., 'In this intense 120-minute sci-fi thriller...').\n"
+        f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points). If the runtime is available, cleverly weave it in naturally (e.g. 'In this gripping 106-minute thriller...').\n"
         "3. Output ONLY a valid JSON object matching this exact shape:\n"
         '{"thought_process": "<explain why this movie perfectly matches in 15 words>", "tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
     )
@@ -753,9 +753,9 @@ def validate_output(candidate: dict[str, object], watched_ids: set[int]) -> dict
             "runtime_min": movie.runtime_min,
             "director": movie.director,
             "genres": list(movie.genres),
-            "vote_average": movie.vote_average
+            "vote_average": movie.vote_average,
         },
-        "description": enforce_description_limit(description)
+        "description": enforce_description_limit(description),
     }
 
 
