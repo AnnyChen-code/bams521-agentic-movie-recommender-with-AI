@@ -46,7 +46,6 @@ GENRE_ALIASES = {
     "mystery": {"mystery", "whodunit", "investigation", "twist"},
     "romance": {"romance", "romantic", "rom-com", "romcom", "love story"},
     "science fiction": {"sci-fi", "science fiction", "space", "futuristic"},
-    "superhero": {"superhero", "superheroes", "marvel", "dc comics", "comic book"},
     "thriller": {"thriller", "tense", "suspense", "suspenseful"},
     "war": {"war", "military", "battlefront"},
 }
@@ -79,7 +78,6 @@ class Movie:
     tmdb_id: int
     title: str
     year: int | None
-    runtime_min: int | None
     genres: tuple[str, ...]
     overview: str
     tagline: str
@@ -170,7 +168,6 @@ def load_movies() -> tuple[Movie, ...]:
             "tmdb_id": tmdb_id,
             "title": title,
             "year": _safe_int(row[index["year"]]),
-            "runtime_min": _safe_int(row[index["runtime_min"]]),
             "genres": split_csvish(row[index["genres"]]),
             "overview": str(row[index["overview"]] or "").strip(),
             "tagline": str(row[index["tagline"]] or "").strip(),
@@ -217,7 +214,6 @@ def load_movies() -> tuple[Movie, ...]:
                 tmdb_id=int(raw_movie["tmdb_id"]),
                 title=str(raw_movie["title"]),
                 year=raw_movie["year"],
-                runtime_min=raw_movie["runtime_min"],
                 genres=tuple(raw_movie["genres"]),
                 overview=str(raw_movie["overview"]),
                 tagline=str(raw_movie["tagline"]),
@@ -274,13 +270,10 @@ def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
         token_weights[token] += 2.0
 
     for phrase, hints in PHRASE_HINTS.items():
-        phrase_norm = normalize_text(phrase)
-        if phrase_norm in normalized:
-            is_negated = any(neg + phrase_norm in normalized for neg in NEGATION_PHRASES)
-            boost = -3.0 if is_negated else 2.5
+        if phrase in normalized:
             for hint in hints:
                 for token in tokenize(hint):
-                    token_weights[token] += boost
+                    token_weights[token] += 2.5
 
     for genre, aliases in GENRE_ALIASES.items():
         for alias in aliases | {genre}:
@@ -682,7 +675,7 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
 
     candidates_text = ""
     for i, m in enumerate(movies):
-        candidates_text += f"[{i+1}] {m.title} ({m.year or 'Unknown'}) | Runtime: {m.runtime_min or 'Unknown'} min | tmdb_id: {m.tmdb_id}\nGenres: {', '.join(m.genres)}\nOverview: {m.overview}\n\n"
+        candidates_text += f"[{i+1}] {m.title} ({m.year or 'Unknown'}) | tmdb_id: {m.tmdb_id}\nGenres: {', '.join(m.genres)}\nOverview: {m.overview}\n\n"
 
     prompt = (
         "You are an expert, persuasive movie recommendation agent.\n"
@@ -692,9 +685,9 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
         f"{candidates_text}"
         "Task:\n"
         "1. Act as a judge. Compare these candidates against the user's specific preferences and pick the single best fit.\n"
-        f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points). If the runtime is available, cleverly weave it in naturally (e.g. 'In this gripping 106-minute thriller...').\n"
+        f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points).\n"
         "3. Output ONLY a valid JSON object matching this exact shape:\n"
-        '{"thought_process": "<explain why this movie perfectly matches in 15 words>", "tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
+        '{"tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
     )
 
     try:
@@ -743,20 +736,7 @@ def validate_output(candidate: dict[str, object], watched_ids: set[int]) -> dict
     if not description:
         raise ValueError("description cannot be empty")
 
-    movie = movie_lookup()[movie_id]
-
-    return {
-        "tmdb_id": movie_id,
-        "movie_info": {
-            "title": movie.title,
-            "year": movie.year,
-            "runtime_min": movie.runtime_min,
-            "director": movie.director,
-            "genres": list(movie.genres),
-            "vote_average": movie.vote_average,
-        },
-        "description": enforce_description_limit(description),
-    }
+    return {"tmdb_id": movie_id, "description": enforce_description_limit(description)}
 
 
 def choose_top_movies(
