@@ -46,6 +46,7 @@ GENRE_ALIASES = {
     "mystery": {"mystery", "whodunit", "investigation", "twist"},
     "romance": {"romance", "romantic", "rom-com", "romcom", "love story"},
     "science fiction": {"sci-fi", "science fiction", "space", "futuristic"},
+    "superhero": {"superhero", "superheroes", "marvel", "dc comics", "comic book"},
     "thriller": {"thriller", "tense", "suspense", "suspenseful"},
     "war": {"war", "military", "battlefront"},
 }
@@ -78,6 +79,7 @@ class Movie:
     tmdb_id: int
     title: str
     year: int | None
+    runtime_min: int | None
     genres: tuple[str, ...]
     overview: str
     tagline: str
@@ -168,6 +170,7 @@ def load_movies() -> tuple[Movie, ...]:
             "tmdb_id": tmdb_id,
             "title": title,
             "year": _safe_int(row[index["year"]]),
+            "runtime_min": _safe_int(row[index["runtime_min"]]),
             "genres": split_csvish(row[index["genres"]]),
             "overview": str(row[index["overview"]] or "").strip(),
             "tagline": str(row[index["tagline"]] or "").strip(),
@@ -214,6 +217,7 @@ def load_movies() -> tuple[Movie, ...]:
                 tmdb_id=int(raw_movie["tmdb_id"]),
                 title=str(raw_movie["title"]),
                 year=raw_movie["year"],
+                runtime_min=raw_movie["runtime_min"],
                 genres=tuple(raw_movie["genres"]),
                 overview=str(raw_movie["overview"]),
                 tagline=str(raw_movie["tagline"]),
@@ -270,16 +274,30 @@ def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
         token_weights[token] += 2.0
 
     for phrase, hints in PHRASE_HINTS.items():
-        if phrase in normalized:
+        phrase_norm = normalize_text(phrase)
+        if phrase_norm in normalized:
+            is_negated = any(neg + phrase_norm in normalized for neg in NEGATION_PHRASES)
+            boost = -3.0 if is_negated else 2.5
             for hint in hints:
                 for token in tokenize(hint):
-                    token_weights[token] += 2.5
+                    token_weights[token] += boost
 
     for genre, aliases in GENRE_ALIASES.items():
         for alias in aliases | {genre}:
             alias_norm = normalize_text(alias)
             if alias_norm and alias_norm in normalized:
-                if any(neg + alias_norm in normalized for neg in NEGATION_PHRASES):
+                is_negated = False
+                for neg in NEGATION_PHRASES:
+                    idx = normalized.find(neg)
+                    while idx >= 0:
+                        window = normalized[idx: idx + 80]
+                        if alias_norm in window:
+                            is_negated = True
+                            break
+                        idx = normalized.find(neg, idx + 1)
+                    if is_negated:
+                        break
+                if is_negated:
                     avoided_genres.add(genre)
                 else:
                     preferred_genres.add(genre)
@@ -292,8 +310,8 @@ def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
             idx = normalized.find(negation, start)
             if idx < 0:
                 break
-            fragment = normalized[idx + len(negation) : idx + len(negation) + 40]
-            for token in fragment.split()[:3]:
+            fragment = normalized[idx + len(negation) : idx + len(negation) + 60]
+            for token in fragment.split()[:5]:
                 if len(token) > 2 and token not in STOPWORDS:
                     explicit_exclusions.add(token)
             start = idx + len(negation)
@@ -675,19 +693,25 @@ def agentic_judge_and_describe(movies: list[Movie], preferences: str, history: l
 
     candidates_text = ""
     for i, m in enumerate(movies):
-        candidates_text += f"[{i+1}] {m.title} ({m.year or 'Unknown'}) | tmdb_id: {m.tmdb_id}\nGenres: {', '.join(m.genres)}\nOverview: {m.overview}\n\n"
+        candidates_text += f"[{i+1}] {m.title} ({m.year or 'Unknown'}) | Runtime: {m.runtime_min or 'Unknown'} min | tmdb_id: {m.tmdb_id}\nGenres: {', '.join(m.genres)}\nOverview: {m.overview}\n\n"
 
     prompt = (
-        "You are an expert, persuasive movie recommendation agent.\n"
+        "You are an expert, emotionally intelligent movie recommendation agent.\n"
         f"User preferences: {preferences}\n"
         f"Watch history: {', '.join(history[:8]) if history else 'None provided'}\n\n"
         "Here are the top candidates that match their taste profile:\n"
         f"{candidates_text}"
         "Task:\n"
-        "1. Act as a judge. Compare these candidates against the user's specific preferences and pick the single best fit.\n"
-        f"2. Write a short, persuasive recommendation blurb for your chosen candidate (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points).\n"
+        "1. Act as a judge. Pick the single best candidate that fits the user's preferences.\n"
+        f"2. Write a persuasive, emotionally resonant recommendation blurb (max {LLM_CHAR_BUDGET} chars, no spoilers, no bullet points). "
+        "Follow these 5 rules for the blurb:\n"
+        "   RULE 1 - OPEN WITH HISTORY: Start by referencing a specific movie from their Watch history that shares DNA with your pick (e.g. 'Since you loved [watched movie]...'). Skip if no history.\n"
+        "   RULE 2 - WEAVE IN RUNTIME: In the first two sentences, naturally embed the runtime (e.g. 'In this gripping [X]-minute thriller...'). Do NOT skip this if runtime is available.\n"
+        "   RULE 3 - VIVID DESCRIPTION: Use 1-2 sentences of vivid, specific, emotionally charged language about the experience. Avoid generic words like 'great' or 'amazing'.\n"
+        "   RULE 4 - DEFEND NEGATIVES: If the user expressed hates or avoidances, actively rebut them in your blurb (e.g. 'This isn't a loud action flick, but a...'). This builds trust.\n"
+        "   RULE 5 - COMPELLING CLOSE: End with one sentence that makes them want to press play right now.\n"
         "3. Output ONLY a valid JSON object matching this exact shape:\n"
-        '{"tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
+        '{"thought_process": "<why this movie perfectly matches in 15 words>", "tmdb_id": <selected tmdb_id integer>, "description": "<your blurb here>"}\n'
     )
 
     try:
@@ -736,7 +760,20 @@ def validate_output(candidate: dict[str, object], watched_ids: set[int]) -> dict
     if not description:
         raise ValueError("description cannot be empty")
 
-    return {"tmdb_id": movie_id, "description": enforce_description_limit(description)}
+    movie = movie_lookup()[movie_id]
+
+    return {
+        "tmdb_id": movie_id,
+        "movie_info": {
+            "title": movie.title,
+            "year": movie.year,
+            "runtime_min": movie.runtime_min,
+            "director": movie.director,
+            "genres": list(movie.genres),
+            "vote_average": movie.vote_average,
+        },
+        "description": enforce_description_limit(description),
+    }
 
 
 def choose_top_movies(
