@@ -474,7 +474,7 @@ def score_movie(
 
     for genre in signals["avoided_genres"]:
         if genre in movie_genres:
-            score -= 10.0
+            score -= 25.0
 
     matched_preferred = sum(1 for genre in signals["preferred_genres"] if genre in movie_genres)
     preferred_count = len(signals["preferred_genres"])
