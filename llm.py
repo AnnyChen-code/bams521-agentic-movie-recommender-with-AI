@@ -46,6 +46,7 @@ GENRE_ALIASES = {
     "mystery": {"mystery", "whodunit", "investigation", "twist"},
     "romance": {"romance", "romantic", "rom-com", "romcom", "love story"},
     "science fiction": {"sci-fi", "science fiction", "space", "futuristic"},
+    "superhero": {"superhero", "superheroes", "marvel", "dc comics", "comic book"},
     "thriller": {"thriller", "tense", "suspense", "suspenseful"},
     "war": {"war", "military", "battlefront"},
 }
@@ -273,10 +274,13 @@ def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
         token_weights[token] += 2.0
 
     for phrase, hints in PHRASE_HINTS.items():
-        if phrase in normalized:
+        phrase_norm = normalize_text(phrase)
+        if phrase_norm in normalized:
+            is_negated = any(neg + phrase_norm in normalized for neg in NEGATION_PHRASES)
+            boost = -3.0 if is_negated else 2.5
             for hint in hints:
                 for token in tokenize(hint):
-                    token_weights[token] += 2.5
+                    token_weights[token] += boost
 
     for genre, aliases in GENRE_ALIASES.items():
         for alias in aliases | {genre}:
